@@ -1,0 +1,457 @@
+﻿Build1=Default,B4RDev
+Group=Default Group
+Library1=rcore
+Library2=resp8266wifi
+Library3=rmqtt
+Library4=rrandomaccessfile
+Library5=reeprom
+Module1=GlobalStore
+Module2=TimeNist
+NumberOfFiles=0
+NumberOfLibraries=5
+NumberOfModules=2
+Version=3.5
+@EndOfDesignText@
+
+#Region Project Attributes
+	#AutoFlushLogs: True
+	#CheckArrayBounds: True
+	#StackBufferSize: 600
+#End Region
+'Ctrl+Click to open the C code folder: ide://run?File=%WINDIR%\System32\explorer.exe&Args=%PROJECT%\Objects\Src
+
+'Description - 2nd Feb 2021
+
+' A test program to control the 4 Relay Module from an ESP chip, in this case a Node MCU.
+
+' The wiring from the Node MCU chip to the relay board is as follows:
+
+	' The Blue LED is connected to GPIO 2 which is marked as D4 - this is the onboard LED
+	' The Red LED is connected to GPIO 12 which is marked as D6
+
+	' Relay 1 is connected to GPIO 0 which is marked as D3
+	' Relay 2 is connected to GPIO 4 which is marked as D2
+	' Relay 3 is connected to GPIO 5 which is marked as D1
+	' Relay 4 is connected to GPIO 16 which is marked as D0
+
+	' Push Button Switch is connected to GPIO 14 which is marked as D5
+	
+	' GND from the Node MCU board is connected to GND on the Relay Board
+	' 3.3v from the Node MCU board is connected to Vcc on the Relay Board 
+	
+	' The MQTT Topic is 4RELAYBOARD
+	
+	' Relays 1,2,3,4 are controlled by the following messages being sent to that topic:
+	
+	' 1-OFF or 1-ON
+	' 2-OFF or 2-ON
+	' 3-OFF or 3-ON
+	' 4-OFF or 4-ON
+	' ALL-OFF
+	' ALL-ON
+	
+	' Relay 1 has a Night Light function.
+	
+	' Relay 1 is also controlled by the clock and this functionality overrides the previous commands - if 
+	' you send an ON command to Relay 1 and it is in the OFF phase of the timer, then it will get switched off.
+	
+	' To set the time at which Relay 1 turns on and off, use the following message:
+
+	' ONOFF:HHmm:HHmm
+
+	' where the first HHMM is the On time, and the second HHmm is the Off time.	
+	' So if you want the light to come on at 1930 and off at 2345, send "ONOFF:1930:2345"
+	
+	' If you want to disable the Night Light and switch it off for the night, use: NIGHTLIGHTDISABLED
+	' If you want to enable the Night Light and have it go back to normal operation, use: NIGHTLIGHTENABLED
+	
+	'If the Night Light is Disabled, it switches off. It will re-enable itself after the Siwtch Off time has passed.
+	
+Sub Process_Globals
+	
+	Public Serial1 As Serial
+	
+	Private BlueLEDPin As Pin
+	Private RedLEDPin As Pin
+	
+	Private PushButtonPin As Pin
+	Private LastState As Boolean = True
+	Private RunTime As ULong
+	
+	Private Relay1ControlPin As Pin
+	Private Relay2ControlPin As Pin
+	Private Relay3ControlPin As Pin
+	Private Relay4ControlPin As Pin
+	
+	'*********
+	' Pinouts
+	'*********
+
+	' Relay 1 is connected to GPIO 0 which is marked as D3
+	' Relay 2 is connected to GPIO 4 which is marked as D2
+	' Relay 3 is connected to GPIO 5 which is marked as D1
+	' Relay 4 is connected to GPIO 16 which is marked as D0
+
+	' Push Button Switch is connected to GPIO 14 which is marked as D5
+	' The Blue LED
+	
+	Dim OFF As Boolean = True
+	Dim ON As Boolean = False
+		
+	Public Counter As Int
+	
+	Public mqttClient As MqttClient
+	Private wifiConnection As ESP8266WiFi
+	Private wifiClient As WiFiSocket
+	Private mqttConnectionOptions As MqttConnectOptions
+	
+	Private clock As Timer
+	
+	Private BlueLEDTimer As Timer
+	Private RedLEDTimer As Timer
+	
+	Private ByteConverter As ByteConverter
+	Private Serializator As B4RSerializator
+	
+	Private EEPROM_Access As EEPROM
+	
+	Private const DATA_STORE_LOCATION As Int = 100
+
+End Sub
+
+Private Sub AppStart
+	
+	Dim be(10) As Object 'used as a storage buffer for the serializator
+
+	Dim ByteLengthOfDataInEEPROM() As Byte
+	Dim ActualLengthOfDataInEEPROM As Int
+	Dim ByteDataInEEPROM() As Byte
+	Dim ObjectsInEEPROM() As Object
+	
+	Serial1.Initialize(115200)
+	
+	PushButtonPin.Initialize(14, PushButtonPin.MODE_INPUT_PULLUP)	'Orange wire
+	PushButtonPin.AddListener("PushButton_StateChanged")
+	
+	BlueLEDTimer.Initialize("BlueLEDTimer_Tick",200)
+	BlueLEDTimer.Enabled = True
+	
+	RedLEDTimer.Initialize("RedLEDTimer_Tick",1000)
+	RedLEDTimer.Enabled = True
+	
+	SwitchAllRelays(OFF)
+
+	' NOTE: GPIO 2 is D4 on the NodeMCU board which is the Blue LED
+	BlueLEDPin.Initialize(2, BlueLEDPin.MODE_OUTPUT)
+	
+	' NOTE: GPIO 12 is D6 on the NodeMCU board
+	RedLEDPin.Initialize(12, RedLEDPin.MODE_OUTPUT)
+
+	' NOTE: GPIO 0 is D3 on the NodeMCU board
+	Relay1ControlPin.Initialize(0, Relay1ControlPin.MODE_OUTPUT)
+	
+	' NOTE: GPIO 4 is D2 on the NodeMCU board
+	Relay2ControlPin.Initialize(4, Relay2ControlPin.MODE_OUTPUT)
+	
+	' NOTE: GPIO 5 is D1 on the NodeMCU board
+	Relay3ControlPin.Initialize(5, Relay3ControlPin.MODE_OUTPUT)
+
+	' NOTE: GPIO 16 is D0 on the NodeMCU board
+	Relay4ControlPin.Initialize(16, Relay4ControlPin.MODE_OUTPUT)
+
+	SwitchAllRelays(OFF)
+	
+	Dim IsConnected As  Boolean = False
+	Do While IsConnected = False
+		'Connect to the wireless network
+		If wifiConnection.Connect2("JB_network","fc4aa12d83") Then
+			Log("Connected to JB_network.")
+			IsConnected = True
+			Log("My ip: ", wifiConnection.LocalIp)
+		Else
+			Log("Failed to connect to Wifi.")
+			BlueLEDTimer.Interval = 200
+			BlueLEDTimer.Enabled = True
+		End If
+	Loop
+	
+	'Connect to the Cloud MQTT server
+	mqttClient.Initialize2(wifiClient.Stream,"m20.cloudmqtt.com",17731, Rnd(0, 999999999),"Mqtt_MessageArrived", "Mqtt_Disconnected")
+	mqttConnectionOptions.Initialize("tvpgffmb", "hIHVIrRFJxmm")
+
+	If mqttClient.Connect2(mqttConnectionOptions) = True Then
+		Log("Connected to MQTT")
+		BlueLEDTimer.Interval = 750
+
+	Else
+		Log("Did not connect to MQTT")
+	End If
+
+	'Load up the stored Start amd End time	
+
+	'Get two bytes out of the EEPROM from the DATA_STORE_LOCATION
+	'These 2 bytes give the length of the data in the EEPROM
+	
+	ByteLengthOfDataInEEPROM = EEPROM_Access.ReadBytes(DATA_STORE_LOCATION, 2)
+		
+	'Convert these two bytes into an Integer - this is the number of bytes making up the objects that are stored in the EEPROM
+	ActualLengthOfDataInEEPROM =  ByteConverter.IntsFromBytes(ByteLengthOfDataInEEPROM)(0)
+	
+	If ActualLengthOfDataInEEPROM > 0 Then
+
+		'Get the data out of the EEPROM and convert those bytes back into an array of objects
+		ByteDataInEEPROM = EEPROM_Access.ReadBytes(DATA_STORE_LOCATION+2, ActualLengthOfDataInEEPROM)
+		
+		'Object Arrays are stored as a series of bytes - the serializator takes the bytes out
+		'and recreates the objects
+		
+		ObjectsInEEPROM = Serializator.ConvertBytesToArray(ByteDataInEEPROM, be)
+
+		'The Object at Index 0 is the Start Time as a string, like this - "1230"
+		'The Object at Index 1 is the End Time as a string, like this - "1330"		
+
+		Dim ontime As String = ObjectsInEEPROM(0)
+		Dim offtime As String = ObjectsInEEPROM(1)
+	
+		'The Global Store is required as you can't change Constant values in B4R	
+		GlobalStore.Put(0, ontime)
+		GlobalStore.Put(1, offtime)
+
+	Else
+		'There is nothing in the EEPROM, so let's write some data in
+		
+		Dim ListOfObjectsToStore() As Object = Array("00:01","00:02")
+		WriteToEEPROM(ListOfObjectsToStore)
+	End If
+	
+	Dim NightLightState As String = "ENABLED"
+	GlobalStore.Put(2, NightLightState)
+	
+	mqttClient.Subscribe("4RELAYBOARD/#", 0)
+	
+	TimeNist.Start
+	clock.Initialize("clock_Tick", 1000)
+	
+End Sub
+
+Private Sub PushButton_StateChanged(State As Boolean)
+	Dim LongPress As Int = 1000, ShortPress As Int = 500
+
+	If Not(State) And LastState Then      'Button Pressed
+		LastState = State
+		RunTime = Millis()                'Runtime
+	End If
+
+	If State And Not(LastState) Then      'Button Released
+		If ((Millis() - RunTime) <= ShortPress) And ((Millis() - RunTime) <= LongPress) Then
+			Log("Short press")            'Run some code
+			mqttClient.Publish("4RELAYBOARD", Serializator.ConvertArrayToBytes(Array("SHORT PRESS")))
+		End If
+
+		If (Millis() - RunTime) > LongPress Then
+			Log("Long press")             'Run some code
+			mqttClient.Publish("4RELAYBOARD", Serializator.ConvertArrayToBytes(Array("LONG PRESS")))
+		End If
+	End If
+
+	LastState = State
+End Sub
+
+Private Sub BlueLEDTimer_Tick
+	Dim currentState As Boolean = BlueLEDPin.DigitalRead
+	'Log("CurrentState: ", currentState)
+	Dim NewState As Boolean = Not(currentState)
+	'Log("NewState: ", NewState)
+	BlueLEDPin.DigitalWrite(NewState)
+End Sub
+
+Private Sub RedLEDTimer_Tick
+	Dim currentState As Boolean = RedLEDPin.DigitalRead
+	'Log("CurrentState: ", currentState)
+	Dim NewState As Boolean = Not(currentState)
+	'Log("NewState: ", NewState)
+	RedLEDPin.DigitalWrite(NewState)
+End Sub
+
+Private Sub SwitchAllRelays(Status As Boolean)
+	Relay1ControlPin.DigitalWrite(Status)
+	Relay2ControlPin.DigitalWrite(Status)
+	Relay3ControlPin.DigitalWrite(Status)
+	Relay4ControlPin.DigitalWrite(Status)
+End Sub
+
+Private Sub mqtt_MessageArrived (Topic As String, Payload() As Byte)
+
+	Dim NightLightEnabledState As String
+	
+	'A Message has been received from the MQTT server
+	Log("Message Received!!")
+	Log(Topic, Payload)
+	
+	If Topic = "4RELAYBOARD" Then
+		If Payload = "ALL-OFF" Then
+			
+			SwitchAllRelays(True)
+			
+		Else if Payload = "ALL-ON" Then
+			
+			SwitchAllRelays(ON)
+				
+		Else If Payload = "1-ON" Then
+			Relay1ControlPin.DigitalWrite(ON)
+
+		Else If Payload = "1-OFF" Then
+			Relay1ControlPin.DigitalWrite(OFF)
+			
+		Else If Payload = "2-ON" Then
+			Relay2ControlPin.DigitalWrite(ON)
+
+		Else If Payload = "2-OFF" Then
+			Relay2ControlPin.DigitalWrite(OFF)
+
+		Else If Payload = "3-ON" Then
+			Relay3ControlPin.DigitalWrite(ON)
+
+		Else If Payload = "3-OFF" Then
+			Relay3ControlPin.DigitalWrite(OFF)
+
+		Else If Payload = "4-ON" Then
+			Relay4ControlPin.DigitalWrite(ON)
+
+		Else If Payload = "4-OFF" Then
+			Relay4ControlPin.DigitalWrite(OFF)
+			
+		else if ByteConverter.SubString2(Payload, 0, 5) = "ONOFF" Then
+			
+			' The command to send is :ONOFF:HHmm:HHmm
+			' For example ONOFF:1230:1700 means the light will go on at 1230 and off at 1700
+			
+			Dim ontime As String = ByteConverter.StringFromBytes(ByteConverter.SubString2(Payload, 6, 10))
+			Dim offtime As String = ByteConverter.StringFromBytes(ByteConverter.SubString2(Payload, 11, 15))
+			
+			Dim ListOfObjectsToStore() As Object = Array(ontime,offtime,"Hello", "World",1234, False, True, False)
+			WriteToEEPROM(ListOfObjectsToStore)
+
+			GlobalStore.Put(0, ontime) 'store value in slot #0
+			GlobalStore.Put(1, offtime) 'store value in slot #0
+
+		else if Payload = "NIGHTLIGHTDISABLED" Then
+
+			Log("Night light disabled")
+			NightLightEnabledState = "DISABLED"
+			GlobalStore.Put(2, NightLightEnabledState)
+			Relay1ControlPin.DigitalWrite(OFF)
+			
+		else if Payload = "NIGHTLIGHTENABLED" Then
+
+			Log("Night light enabled")
+			NightLightEnabledState = "ENABLED"
+			GlobalStore.Put(2, NightLightEnabledState)
+			Relay1ControlPin.DigitalWrite(ON)
+
+		End If
+	End If
+End Sub
+
+Sub mqtt_Connected (Success As Boolean)
+	If Success = False Then
+		Log("Error connecting")
+	Else
+	End If
+End Sub
+
+Private Sub mqtt_Disconnected
+	Log("MQTT Disconnected")
+	If mqttClient.Connect2(mqttConnectionOptions) = True Then
+		Log("Connected to MQTT")
+	Else
+		Log("Did not connect to MQTT")
+	End If
+End Sub
+
+Public Sub TimeIsAvailable
+	clock.Enabled = True
+End Sub
+
+Private Sub Clock_Tick
+	
+	Dim CurrentTimeHour As Int
+	Dim CurrentTimeMinutes As Int
+	
+	Dim StartTimeInElapsedMinutes As Int
+	Dim EndTimeInElapsedMinutes As Int
+	Dim ActualTimeInElapsedMinutes As Int
+	
+	Dim onTime As String = ByteConverter.StringFromBytes(GlobalStore.Slot0)
+	Dim offTime As String = ByteConverter.StringFromBytes(GlobalStore.Slot1)
+	
+	Dim time_on_Hours As String = ByteConverter.StringFromBytes(ByteConverter.SubString2(onTime, 0, 2))
+	Dim time_on_Hours_Int As Int = Bit.ParseInt(time_on_Hours, 10)
+	
+	Dim time_on_Mins As String = ByteConverter.StringFromBytes(ByteConverter.SubString2(onTime, 2, 4))
+	Dim time_on_Mins_Int As Int = Bit.ParseInt(time_on_Mins, 10)
+	
+	Dim time_off_Hours As String = ByteConverter.StringFromBytes(ByteConverter.SubString2(offTime, 0, 2))
+	Dim time_off_Hours_Int As Int = Bit.ParseInt(time_off_Hours, 10)
+	
+	Dim time_off_Mins As String = ByteConverter.StringFromBytes(ByteConverter.SubString2(offTime, 2, 4))
+	Dim time_off_Mins_Int As Int = Bit.ParseInt(time_off_Mins, 10)
+	
+	StartTimeInElapsedMinutes = time_on_Hours_Int * 60 + time_on_Mins_Int
+	EndTimeInElapsedMinutes = time_off_Hours_Int * 60 + (time_off_Mins_Int - 1)
+	
+	'Log("Date: ", TimeNist.GetDate)
+	'Log("Time (UTC): ", NumberFormat(TimeNist.GetHours, 2, 0), ":", NumberFormat(TimeNist.GetMinutes, 2, 0), _
+	'	":", NumberFormat(TimeNist.GetSeconds, 2, 0))
+	
+	CurrentTimeHour = 	NumberFormat(TimeNist.GetHours, 2, 0)
+	CurrentTimeMinutes = NumberFormat(TimeNist.GetMinutes, 2, 0)
+		
+	ActualTimeInElapsedMinutes = CurrentTimeHour * 60 + CurrentTimeMinutes
+	
+	Dim NightLightEnabledState As String = ByteConverter.StringFromBytes(GlobalStore.Slot2)
+	
+	If NightLightEnabledState = "ENABLED" Then
+		' If the night light is Enabled, do the time check
+		If (ActualTimeInElapsedMinutes >= StartTimeInElapsedMinutes) And (ActualTimeInElapsedMinutes <= EndTimeInElapsedMinutes) Then
+			Relay1ControlPin.DigitalWrite(ON)
+		Else
+			Relay1ControlPin.DigitalWrite(OFF)
+		End If
+	Else
+		
+		' If the Night Light is disabled, but the actual time is past the programmed End Time,
+		' then the NightLight is Enabled.
+
+		If ActualTimeInElapsedMinutes >EndTimeInElapsedMinutes Then
+			Log("Night light renabled")
+			NightLightEnabledState = "ENABLED"
+			GlobalStore.Put(2,NightLightEnabledState)
+		End If
+	
+	End If
+End Sub
+
+Private Sub WriteToEEPROM(ListOfObjectsToStore() As Object)
+	
+	Dim ByteDataToStore() As Byte
+
+	'Convert the array of objects into a sequence of bytes.
+	ByteDataToStore = Serializator.ConvertArrayToBytes(ListOfObjectsToStore)
+ 
+	'Store the length of the data being written into the EEPROM as an Integer taking up two bytes at Storage Location 700 in the EEPROM
+	EEPROM_Access.WriteBytes(ByteConverter.IntsToBytes(Array As Int(ByteDataToStore.Length)), DATA_STORE_LOCATION)
+	
+	'Now write out all the bytes into the EEPROM
+	EEPROM_Access.WriteBytes(ByteDataToStore, DATA_STORE_LOCATION + 2)
+
+End Sub
+
+
+'	Dim ListOfObjectsToStore() As Object = Array("10:24","14:42","Hello", "World",1234, False, True, False)
+'	WriteToEEPROM(ListOfObjectsToStore)
+
+
+'		For Each o As Object In ObjectsInEEPROM
+'			Log("      Found Object: ",o)
+'		Next
